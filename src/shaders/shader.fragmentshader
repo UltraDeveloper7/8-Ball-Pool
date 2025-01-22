@@ -30,11 +30,16 @@ struct Light
 {
     vec3 position;
     vec3 color;
+    bool isOn;
 };
 
 uniform samplerCube irradianceMap;
 uniform samplerCube prefilterMap;
 uniform sampler2D brdfLUT;
+
+// For shadow:
+uniform sampler2D shadowMap[14];
+uniform mat4 lightSpaceMatrix[14];
 
 uniform int lightCount;
 uniform Light lights[14];
@@ -105,6 +110,43 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
     return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }   
 
+float ShadowCalculation(vec4 fragPosLightSpace, sampler2D shadowMap)
+{
+    // Perform perspective divide
+    vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    // Transform to [0,1] range
+    projCoords = projCoords * 0.5 + 0.5;
+
+    // Get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
+    float closestDepth = texture(shadowMap, projCoords.xy).r; 
+    // Get depth of current fragment from light's perspective
+    float currentDepth = projCoords.z;
+
+    // Bias to avoid shadow acne
+    float bias = 0.005;
+    float shadow = currentDepth > closestDepth + bias ? 1.0 : 0.0;
+
+    // PCF to soften shadow edges
+    shadow = 0.0;
+    vec2 texelSize = 1.0 / textureSize(shadowMap, 0);
+    for(int x = -1; x <= 1; ++x)
+    {
+        for(int y = -1; y <= 1; ++y)
+        {
+            float pcfDepth = texture(shadowMap, projCoords.xy + vec2(x, y) * texelSize).r;
+            shadow += currentDepth - bias > pcfDepth ? 1.0 : 0.0;
+        }
+    }
+    shadow /= 9.0;
+
+    // Ensure shadow is only applied within the light's view frustum
+    if(projCoords.z > 1.0)
+        shadow = 0.0;
+
+    return shadow;
+}
+
+
 void main()
 {
     vec3 diffuse = pow(material.diffuse, vec3(2.2));
@@ -137,6 +179,7 @@ void main()
     vec3 Lo = vec3(0.0);
     for(int i = 0; i < lightCount; ++i) 
     {
+        if (!lights[i].isOn) continue;
         vec3 L = normalize(lights[i].position - Position);
         vec3 H = normalize(V + L);
         float distance = length(lights[i].position - Position);
@@ -157,7 +200,11 @@ void main()
 
         float NdotL = max(dot(N, L), 0.0);        
 
-        Lo += (kD * diffuse / PI + specular) * radiance * NdotL;
+        // Compute L, NDF
+        vec4 fragPosLightSpace = lightSpaceMatrix[i] * vec4(Position, 1.0);
+        float shadow = ShadowCalculation(fragPosLightSpace, shadowMap[i]);
+
+        Lo += (kD * diffuse / PI + specular) * radiance * NdotL * (1.0 - shadow);
     }   
 
     vec3 F = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
